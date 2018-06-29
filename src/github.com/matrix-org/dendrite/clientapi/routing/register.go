@@ -16,7 +16,6 @@
 package routing
 
 import (
-	"context"
 	"crypto/hmac"
 	"crypto/sha1"
 	"encoding/json"
@@ -39,6 +38,7 @@ import (
 	"github.com/matrix-org/dendrite/clientapi/auth/storage/devices"
 	"github.com/matrix-org/dendrite/clientapi/httputil"
 	"github.com/matrix-org/dendrite/clientapi/jsonerror"
+	"github.com/matrix-org/dendrite/clientapi/userutil"
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/util"
 	"github.com/prometheus/client_golang/prometheus"
@@ -162,9 +162,9 @@ func newUserInteractiveResponse(
 // http://matrix.org/speculator/spec/HEAD/client_server/unstable.html#post-matrix-client-unstable-register
 type registerResponse struct {
 	UserID      string                       `json:"user_id"`
-	AccessToken string                       `json:"access_token"`
+	AccessToken string                       `json:"access_token,omitempty"`
 	HomeServer  gomatrixserverlib.ServerName `json:"home_server"`
-	DeviceID    string                       `json:"device_id"`
+	DeviceID    string                       `json:"device_id,omitempty"`
 }
 
 // recaptchaResponse represents the HTTP response from a Google Recaptcha server
@@ -520,8 +520,10 @@ func handleRegistrationFlow(
 		// If no error, application service was successfully validated.
 		// Don't need to worry about appending to registration stages as
 		// application service registration is entirely separate.
-		return completeRegistration(req.Context(), accountDB, deviceDB,
-			r.Username, "", appserviceID, r.InitialDisplayName)
+		return completeRegistration(
+			req, accountDB, deviceDB, r.Username, "", appserviceID,
+			r.InitialDisplayName, cfg.Matrix.ServerName,
+		)
 
 	case authtypes.LoginTypeDummy:
 		// there is nothing to do
@@ -556,8 +558,10 @@ func checkAndCompleteFlow(
 ) util.JSONResponse {
 	if checkFlowCompleted(flow, cfg.Derived.Registration.Flows) {
 		// This flow was completed, registration can continue
-		return completeRegistration(req.Context(), accountDB, deviceDB,
-			r.Username, r.Password, "", r.InitialDisplayName)
+		return completeRegistration(
+			req, accountDB, deviceDB, r.Username, r.Password, "",
+			r.InitialDisplayName, cfg.Matrix.ServerName,
+		)
 	}
 
 	// There are still more stages to complete.
@@ -607,10 +611,10 @@ func LegacyRegister(
 			return util.MessageResponse(http.StatusForbidden, "HMAC incorrect")
 		}
 
-		return completeRegistration(req.Context(), accountDB, deviceDB, r.Username, r.Password, "", nil)
+		return completeRegistration(req, accountDB, deviceDB, r.Username, r.Password, "", nil, cfg.Matrix.ServerName)
 	case authtypes.LoginTypeDummy:
 		// there is nothing to do
-		return completeRegistration(req.Context(), accountDB, deviceDB, r.Username, r.Password, "", nil)
+		return completeRegistration(req, accountDB, deviceDB, r.Username, r.Password, "", nil, cfg.Matrix.ServerName)
 	default:
 		return util.JSONResponse{
 			Code: http.StatusNotImplemented,
@@ -649,11 +653,11 @@ func parseAndValidateLegacyLogin(req *http.Request, r *legacyRegisterRequest) *u
 }
 
 func completeRegistration(
-	ctx context.Context,
+	req *http.Request,
 	accountDB *accounts.Database,
 	deviceDB *devices.Database,
 	username, password, appserviceID string,
-	displayName *string,
+	displayName *string, serverName gomatrixserverlib.ServerName,
 ) util.JSONResponse {
 	if username == "" {
 		return util.JSONResponse{
@@ -669,7 +673,7 @@ func completeRegistration(
 		}
 	}
 
-	acc, err := accountDB.CreateAccount(ctx, username, password, appserviceID)
+	acc, err := accountDB.CreateAccount(req.Context(), username, password, appserviceID)
 	if err != nil {
 		return util.JSONResponse{
 			Code: http.StatusInternalServerError,
@@ -682,6 +686,19 @@ func completeRegistration(
 		}
 	}
 
+	// Check whether inhibit_login option is set. If so, don't create an access
+	// token or a device for this user
+	inhibitLogin := req.URL.Query().Get("inhibit_login")
+	if inhibitLogin == "1" || strings.ToLower(inhibitLogin) == "true" {
+		return util.JSONResponse{
+			Code: http.StatusOK,
+			JSON: registerResponse{
+				UserID:     userutil.MakeUserID(username, serverName),
+				HomeServer: acc.ServerName,
+			},
+		}
+	}
+
 	token, err := auth.GenerateAccessToken()
 	if err != nil {
 		return util.JSONResponse{
@@ -690,8 +707,8 @@ func completeRegistration(
 		}
 	}
 
-	// // TODO: Use the device ID in the request.
-	dev, err := deviceDB.CreateDevice(ctx, username, nil, token, displayName)
+	// TODO: Use the device ID in the request.
+	dev, err := deviceDB.CreateDevice(req.Context(), username, nil, token, displayName)
 	if err != nil {
 		return util.JSONResponse{
 			Code: http.StatusInternalServerError,
